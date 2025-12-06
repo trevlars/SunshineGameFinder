@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Text.Json.Serialization;
+using System.Runtime.InteropServices;
 
 namespace SunshineGameFinder
 {
@@ -77,8 +78,15 @@ namespace SunshineGameFinder
             // Do not normalize steam:// protocol
             if (!path.StartsWith("steam://", StringComparison.OrdinalIgnoreCase))
             {
-                // Normalize slashes to backslashes
-                path = path.Replace("/", "\\");
+                // Normalize slashes based on OS
+                if (OperatingSystem.IsWindows())
+                {
+                    path = path.Replace("/", "\\");
+                }
+                else
+                {
+                    path = path.Replace("\\", "/");
+                }
             }
 
             // If path has spaces we need to wrap it in quotes
@@ -94,20 +102,28 @@ namespace SunshineGameFinder
         {
             if (string.IsNullOrEmpty(path)) return string.Empty;
 
-            // Split into separate paths
-            var paths = path.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            // Split into separate paths (Linux uses colon, Windows uses semicolon)
+            var separator = OperatingSystem.IsWindows() ? ';' : ':';
+            var paths = path.Split(separator, StringSplitOptions.RemoveEmptyEntries);
             
             // Process each path
             var formattedPaths = paths.Select(p => 
             {
                 // Remove spaces at the beginning and end, and any quotes
                 var trimmed = p.Trim().Trim('"');
-                // Normalize slashes (optional, but preferred for Windows)
-                return trimmed.Replace("/", "\\").TrimEnd('\\');
+                // Normalize slashes (forward slashes for Linux, backslashes for Windows)
+                if (OperatingSystem.IsWindows())
+                {
+                    return trimmed.Replace("/", "\\").TrimEnd('\\');
+                }
+                else
+                {
+                    return trimmed.Replace("\\", "/").TrimEnd('/');
+                }
             });
 
-            // Join back with semicolon
-            return string.Join(";", formattedPaths);
+            // Join back with appropriate separator
+            return string.Join(separator.ToString(), formattedPaths);
         }
     }
 

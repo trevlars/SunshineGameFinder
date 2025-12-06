@@ -56,11 +56,16 @@ if (!IsRunAsAdmin())
 }
 
 // constants
-const string wildcatDrive = @"*:\";
-const string steamLibraryFolders = @"Program Files (x86)\Steam\steamapps\libraryfolders.vdf";
+const string steamLibraryFolders = ".steam/steam/steamapps/libraryfolders.vdf";
 
 // default values
-var gameDirs = new HashSet<string>() { @"*:\Program Files (x86)\Steam\steamapps\common", @"*:\XboxGames", @"*:\Program Files\EA Games", @"*:\Program Files\Epic Games\", @"*:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\games" };
+var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+var gameDirs = new HashSet<string>() 
+{ 
+    Path.Combine(homeDir, ".steam/steam/steamapps/common"),
+    Path.Combine(homeDir, ".local/share/Epic/EpicGamesLauncher/ProgramData/Manifests"),
+    Path.Combine(homeDir, ".local/share/Ubisoft Game Launcher/games")
+};
 var exclusionWords = new List<string>() { "Steam" };
 var exeExclusionWords = new List<string>() { "Steam", "Cleanup", "DX", "Uninstall", "Touchup", "redist", "Crash", "Editor", "crs-handler" };
 
@@ -79,7 +84,7 @@ rootCommand.Options.Add(addlExeExclusionWordsOption);
 var sunshineConfigLocationOption = new Option<string>("--sunshineConfigLocation", "-c");
 sunshineConfigLocationOption.Description = "Specify the Sunshine apps.json location";
 sunshineConfigLocationOption.AllowMultipleArgumentsPerToken = false;
-sunshineConfigLocationOption.DefaultValueFactory = arg => @"C:\Program Files\Sunshine\config\apps.json";
+sunshineConfigLocationOption.DefaultValueFactory = arg => @"/usr/share/sunshine/apps.json";
 rootCommand.Options.Add(sunshineConfigLocationOption);
 
 var forceOption = new Option<bool>("--force", "-f");
@@ -217,11 +222,33 @@ async Task ScanFolder(string folder)
                 Logger.Log($"Skipping due to excluded word match", LogLevel.Trace);
                 continue;
             }
-            var exe = Directory.GetFiles(gameDir.FullName, "*.exe", SearchOption.AllDirectories).FirstOrDefault(exefile =>
-            {
-                var exeName = new FileInfo(exefile).Name.ToLower();
-                return exeName == gameDir.Name.ToLower() || exeName == gameName.ToLower() || !exeExclusionWords.Any(ew => exeName.Contains(ew.ToLower()));
-            });
+            // On Linux, look for executables without extension or with .sh extension
+            var exe = Directory.GetFiles(gameDir.FullName, "*", SearchOption.AllDirectories)
+                .Where(f => 
+                {
+                    var fileInfo = new FileInfo(f);
+                    // Check if file is executable (has execute permission) or has common executable extensions
+                    var name = fileInfo.Name.ToLower();
+                    var isExecutable = fileInfo.Extension == "" || 
+                                       fileInfo.Extension == ".sh" || 
+                                       fileInfo.Extension == ".AppImage" ||
+                                       name.EndsWith(".x86_64") ||
+                                       name.EndsWith(".x86") ||
+                                       name.EndsWith(".bin");
+                    return isExecutable;
+                })
+                .FirstOrDefault(exefile =>
+                {
+                    var exeName = new FileInfo(exefile).Name.ToLower();
+                    var exeNameWithoutExt = Path.GetFileNameWithoutExtension(exeName).ToLower();
+                    var gameNameLower = gameName.ToLower();
+                    var dirNameLower = gameDir.Name.ToLower();
+                    return exeName == dirNameLower || 
+                           exeName == gameNameLower || 
+                           exeNameWithoutExt == dirNameLower ||
+                           exeNameWithoutExt == gameNameLower ||
+                           !exeExclusionWords.Any(ew => exeName.Contains(ew.ToLower()));
+                });
             if (string.IsNullOrEmpty(exe))
             {
                 Logger.Log($"EXE not be found", LogLevel.Warning);
@@ -235,7 +262,7 @@ async Task ScanFolder(string folder)
                 {
                     sunshineAppInstance.apps.Remove(existingApp);
                 }
-                if (exe.Contains("gamelaunchhelper.exe"))
+                if (exe.Contains("gamelaunchhelper") || exe.Contains("gamelaunchhelper.exe"))
                 {
                     //xbox game pass game
                     existingApp = new SunshineApp()
@@ -257,7 +284,7 @@ async Task ScanFolder(string folder)
                         WorkingDir = ""
                     };
                 }
-                string coversFolderPath = Path.GetFullPath(sunshineRootFolder.Replace("\\", "/") + "/covers/");
+                string coversFolderPath = Path.GetFullPath(Path.Combine(sunshineRootFolder, "covers"));
                 string fullPathOfCoverImage = await ImageScraper.SaveIGDBImageToCoversFolder(gameName, coversFolderPath);
                 if (!string.IsNullOrEmpty(fullPathOfCoverImage))
                 {
@@ -284,18 +311,11 @@ async Task ScanFolder(string folder)
     Console.WriteLine(""); //blank line to separate platforms
 }
 
-var logicalDrives = DriveInfo.GetDrives();
-var wildcatDriveLetter = new Regex(Regex.Escape(wildcatDrive));
-
-foreach (var drive in logicalDrives)
+// Check for Steam libraryfolders.vdf in home directory
+var libraryFoldersPath = Path.Combine(homeDir, steamLibraryFolders);
+var file = new FileInfo(libraryFoldersPath);
+if (file.Exists)
 {
-    var libraryFoldersPath = drive.Name + steamLibraryFolders;
-    var file = new FileInfo(libraryFoldersPath);
-    if (!file.Exists)
-    {
-        Logger.Log($"libraryfolders.vdf not found on {file.DirectoryName}, skipping...", LogLevel.Warning);
-        continue;
-    }
     try
     {
         var libraries = VdfConvert.Deserialize(File.ReadAllText(libraryFoldersPath));
@@ -312,7 +332,11 @@ foreach (var drive in logicalDrives)
                 Logger.Log("Failed to parse VDF library value: '" + ex.Message + "' at " + libraryFoldersPath, LogLevel.Warning);
             }
 
-            gameDirs.Add($@"{libProp.Value.Value<string>("path")}\steamapps\common");
+            var steamPath = libProp.Value.Value<string>("path");
+            if (!string.IsNullOrEmpty(steamPath))
+            {
+                gameDirs.Add(Path.Combine(steamPath, "steamapps/common"));
+            }
         }
     }
     catch (Exception vdfException)
@@ -320,18 +344,14 @@ foreach (var drive in logicalDrives)
         Logger.Log("Failed to parse libraryfolders.vdf: '" + vdfException.Message + "' at " + libraryFoldersPath, LogLevel.Warning);
     }
 }
+else
+{
+    Logger.Log($"libraryfolders.vdf not found at {libraryFoldersPath}, skipping...", LogLevel.Warning);
+}
 
 foreach (var platformDir in gameDirs)
 {
-    if (platformDir.StartsWith(wildcatDrive))
-    {
-        foreach (var drive in logicalDrives)
-            await ScanFolder(wildcatDriveLetter.Replace(platformDir, drive.Name, 1));
-    }
-    else
-    {
-        await ScanFolder(platformDir);
-    }
+    await ScanFolder(platformDir);
 }
 
 if (ensureDesktop && !sunshineAppInstance.apps.Any(app => app.Name == "Desktop"))
