@@ -9,7 +9,8 @@ namespace SunshineGameFinder
         static readonly HttpClient HttpClient = new HttpClient();
         private class GamesForBucket
         {
-            public string name { get; set; }
+            public GamesForBucket() { } // Parameterless constructor for JSON deserialization
+            public string name { get; set; } = string.Empty;
         }
 
         public class Artwork

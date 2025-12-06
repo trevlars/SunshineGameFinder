@@ -9,6 +9,71 @@ using System.Security.Principal;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
+// Helper to find Sunshine config location (where Sunshine actually reads from)
+// Note: This function is defined later after GetActualUserHomeDirectory, but declared here for early use
+static string FindSunshineConfig()
+{
+    // Use a simple approach first - we'll refine this after GetActualUserHomeDirectory is available
+    var currentHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    var sudoUser = Environment.GetEnvironmentVariable("SUDO_USER");
+    var homeDir = !string.IsNullOrEmpty(sudoUser) ? 
+        (Directory.Exists($"/home/{sudoUser}") ? $"/home/{sudoUser}" : 
+         Directory.Exists($"/var/home/{sudoUser}") ? $"/var/home/{sudoUser}" : currentHome) : 
+        currentHome;
+    
+    // First, check if sunshine.conf exists and has file_apps setting
+    var sunshineConfPaths = new[]
+    {
+        Path.Combine(homeDir, ".config/sunshine/sunshine.conf"),
+        "/etc/sunshine/sunshine.conf",
+        "/usr/share/sunshine/sunshine.conf"
+    };
+    
+    foreach (var confPath in sunshineConfPaths)
+    {
+        if (File.Exists(confPath))
+        {
+            try
+            {
+                var confContent = File.ReadAllText(confPath);
+                // Look for file_apps = /path/to/apps.json
+                var match = System.Text.RegularExpressions.Regex.Match(confContent, @"file_apps\s*=\s*(.+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    var appsPath = match.Groups[1].Value.Trim().Trim('"', '\'');
+                    if (File.Exists(appsPath))
+                    {
+                        return appsPath;
+                    }
+                }
+            }
+            catch
+            {
+                // Continue to next location if we can't read the config
+            }
+        }
+    }
+    
+    // If no config file specifies it, check common locations where apps.json might exist
+    var existingLocations = new[]
+    {
+        Path.Combine(homeDir, ".config/sunshine/apps.json"),  // Default Linux location
+        "/etc/sunshine/apps.json",                            // System-wide config
+        "/usr/share/sunshine/apps.json"                       // Package default (read-only on immutable systems)
+    };
+    
+    foreach (var location in existingLocations)
+    {
+        if (File.Exists(location))
+        {
+            return location;
+        }
+    }
+    
+    // If no existing file found, default to user config directory (writable, no sudo needed)
+    return Path.Combine(homeDir, ".config/sunshine/apps.json");
+}
+
 // Helper function to check if we can write to a file (or its directory if file doesn't exist)
 static bool CanWriteToPath(string filePath)
 {
@@ -69,10 +134,10 @@ static bool CanWriteToPath(string filePath)
 // Parse args first to get the config location
 var tempRootCommand = new RootCommand();
 var tempSunshineConfigLocationOption = new Option<string>("--sunshineConfigLocation", "-c");
-tempSunshineConfigLocationOption.DefaultValueFactory = arg => @"/usr/share/sunshine/apps.json";
+tempSunshineConfigLocationOption.DefaultValueFactory = arg => FindSunshineConfig();
 tempRootCommand.Options.Add(tempSunshineConfigLocationOption);
 var tempParseResult = tempRootCommand.Parse(args);
-var tempSunshineConfigLocation = tempParseResult.GetValue(tempSunshineConfigLocationOption) ?? @"/usr/share/sunshine/apps.json";
+var tempSunshineConfigLocation = tempParseResult.GetValue(tempSunshineConfigLocationOption) ?? FindSunshineConfig();
 
 // Check if we need admin privileges
 var needsAdmin = !CanWriteToPath(tempSunshineConfigLocation);
@@ -281,9 +346,9 @@ addlExeExclusionWordsOption.AllowMultipleArgumentsPerToken = true;
 rootCommand.Options.Add(addlExeExclusionWordsOption);
 
 var sunshineConfigLocationOption = new Option<string>("--sunshineConfigLocation", "-c");
-sunshineConfigLocationOption.Description = "Specify the Sunshine apps.json location";
+sunshineConfigLocationOption.Description = "Specify the Sunshine apps.json location (default: auto-detected from sunshine.conf or ~/.config/sunshine/apps.json)";
 sunshineConfigLocationOption.AllowMultipleArgumentsPerToken = false;
-sunshineConfigLocationOption.DefaultValueFactory = arg => @"/usr/share/sunshine/apps.json";
+sunshineConfigLocationOption.DefaultValueFactory = arg => FindSunshineConfig();
 rootCommand.Options.Add(sunshineConfigLocationOption);
 
 var forceOption = new Option<bool>("--force", "-f");
@@ -430,39 +495,66 @@ async Task ScanFolder(string folder)
                     var path = f.ToLower();
                     
                     // Exclude common non-executable file types and data directories
-                    var excludedExtensions = new[] { ".bin", ".dll", ".so", ".dylib", ".a", ".lib", ".dat", ".txt", ".json", ".xml", ".lua", ".asset", ".unity", ".meta", ".shader", ".cginc", ".hlsl", ".cg", ".cs", ".bundle", ".framework", ".pak", ".pck", ".exe.pck" };
+                    var excludedExtensions = new[] { ".bin", ".dll", ".so", ".dylib", ".a", ".lib", ".dat", ".txt", ".json", ".xml", ".lua", ".asset", ".unity", ".meta", ".shader", ".cginc", ".hlsl", ".cg", ".cs", ".bundle", ".framework", ".pak", ".pck", ".exe.pck", ".license", ".mimetype" };
                     if (excludedExtensions.Any(ext => name.EndsWith(ext)))
                     {
                         return false;
                     }
                     
+                    // Exclude specific non-executable file names
+                    var excludedFileNames = new[] { "license", "readme", "changelog", "bootfile", "shader_list", "globalgamemanagers", "metadata", "mimetype", "tessellationtable" };
+                    if (excludedFileNames.Any(excluded => name == excluded || name.EndsWith("/" + excluded)))
+                    {
+                        return false;
+                    }
+                    
                     // Exclude files in data/content directories (these are not executables)
-                    var dataDirs = new[] { "/data/", "/_data/", "/content/", "/resources/", "/assets/", "/binaries/win", "/binaries/mac", "/engine/", "/tagame/", "/scripts/", "/level", "/cooked", "/renderer/" };
+                    var dataDirs = new[] { "/data/", "/_data/", "/content/", "/resources/", "/assets/", "/binaries/win", "/binaries/mac", "/engine/", "/tagame/", "/scripts/", "/level", "/cooked", "/renderer/", "/crash_reports/", "/streamingassets/" };
                     if (dataDirs.Any(dir => path.Contains(dir)))
                     {
                         return false;
                     }
                     
-                    // Check for common executable extensions
-                    var executableExtensions = new[] { ".sh", ".appimage", ".run" };
+                    // Check for common executable extensions (must be in root or binaries directory)
+                    var executableExtensions = new[] { ".sh", ".appimage", ".run", ".exe" };
                     if (executableExtensions.Any(ext => name.EndsWith(ext)))
                     {
+                        // Only accept .exe files if they're in the root or a binaries directory (not in data folders)
+                        if (name.EndsWith(".exe"))
+                        {
+                            var parentDir = Path.GetDirectoryName(path)?.ToLower() ?? "";
+                            if (parentDir.EndsWith(gameDir.Name.ToLower()) || 
+                                parentDir.Contains("/binaries/") ||
+                                parentDir.Contains("/bin/"))
+                            {
+                                return true;
+                            }
+                            return false;
+                        }
                         return true;
                     }
                     
-                    // Check if filename matches game name (likely the main executable)
+                    // Check if filename matches game name (likely the main executable) - must be .exe or in root/binaries
                     var exeNameWithoutExt = Path.GetFileNameWithoutExtension(name);
                     var gameNameLower = gameName.ToLower();
                     var dirNameLower = gameDir.Name.ToLower();
                     if (exeNameWithoutExt == gameNameLower || exeNameWithoutExt == dirNameLower)
                     {
-                        return true;
+                        // Must be .exe file or in a binaries/linux directory
+                        if (name.EndsWith(".exe") || path.Contains("/binaries/linux") || path.Contains("/binaries/x86_64") || path.Contains("/bin/"))
+                        {
+                            return true;
+                        }
                     }
                     
-                    // Files without extension in root or Binaries directory might be executables
+                    // Files without extension in root or Binaries directory might be executables (but be very careful)
                     if (fileInfo.Extension == "" && (path.EndsWith("/" + name) || path.Contains("/binaries/linux") || path.Contains("/binaries/x86_64")))
                     {
-                        return true;
+                        // Additional check: filename should look like an executable (not a data file)
+                        if (!excludedFileNames.Any(excluded => name == excluded) && name.Length > 2)
+                        {
+                            return true;
+                        }
                     }
                     
                     return false;
