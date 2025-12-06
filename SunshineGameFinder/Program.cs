@@ -9,8 +9,60 @@ using System.Security.Principal;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
-// Add admin check before any operations
-if (!IsRunAsAdmin())
+// Helper function to check if we can write to a file (or its directory if file doesn't exist)
+static bool CanWriteToPath(string filePath)
+{
+    try
+    {
+        var directory = Path.GetDirectoryName(filePath);
+        if (directory != null && Directory.Exists(directory))
+        {
+            // Check if we can write to the directory
+            var testFile = Path.Combine(directory, ".sunshine_game_finder_write_test");
+            try
+            {
+                File.WriteAllText(testFile, "test");
+                File.Delete(testFile);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+        else if (File.Exists(filePath))
+        {
+            // Check if we can write to the existing file
+            try
+            {
+                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Write);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+    catch
+    {
+    }
+    return false;
+}
+
+// Check if we need admin privileges - only request if we can't write to the config file
+// Parse args first to get the config location
+var tempRootCommand = new RootCommand();
+var tempSunshineConfigLocationOption = new Option<string>("--sunshineConfigLocation", "-c");
+tempSunshineConfigLocationOption.DefaultValueFactory = arg => @"/usr/share/sunshine/apps.json";
+tempRootCommand.Options.Add(tempSunshineConfigLocationOption);
+var tempParseResult = tempRootCommand.Parse(args);
+var tempSunshineConfigLocation = tempParseResult.GetValue(tempSunshineConfigLocationOption) ?? @"/usr/share/sunshine/apps.json";
+
+// Check if we need admin privileges
+var needsAdmin = !CanWriteToPath(tempSunshineConfigLocation);
+
+if (needsAdmin && !IsRunAsAdmin())
 {
     // Restart program and run as admin
     var exeName = Process.GetCurrentProcess().MainModule?.FileName;
@@ -35,6 +87,13 @@ if (!IsRunAsAdmin())
                 {
                     UseShellExecute = true  // Required for interactive sudo password prompt
                 };
+                // Preserve SUDO_USER and other environment variables
+                var sudoUser = Environment.GetEnvironmentVariable("SUDO_USER");
+                var currentUser = Environment.UserName;
+                if (string.IsNullOrEmpty(sudoUser) && currentUser != "root")
+                {
+                    processInfo.EnvironmentVariables["SUDO_USER"] = currentUser;
+                }
                 processInfo.ArgumentList.Add(exeName);
                 foreach (var arg in args)
                 {
@@ -49,7 +108,8 @@ if (!IsRunAsAdmin())
         catch (Exception ex)
         {
             // User declined the UAC prompt or sudo failed
-            Logger.Log($"This application requires administrative privileges. Elevation failed: {ex.Message}", LogLevel.Error);
+            Logger.Log($"Cannot write to config file at {tempSunshineConfigLocation} and elevation failed: {ex.Message}", LogLevel.Error);
+            Logger.Log($"You may need to run with sudo, or specify a config location you can write to with -c option", LogLevel.Error);
             return;
         }
     }
@@ -58,8 +118,132 @@ if (!IsRunAsAdmin())
 // constants
 const string steamLibraryFolders = ".steam/steam/steamapps/libraryfolders.vdf";
 
+// Helper function to get the actual user's home directory (even when running as sudo)
+static string GetActualUserHomeDirectory()
+{
+    // Check SUDO_USER environment variable first (set when running with sudo)
+    var sudoUser = Environment.GetEnvironmentVariable("SUDO_USER");
+    var currentUser = Environment.UserName;
+    var currentHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    
+    Logger.Log($"Current user: {currentUser}, Current home: {currentHome}, SUDO_USER: {sudoUser ?? "not set"}", LogLevel.Trace);
+    
+    if (!string.IsNullOrEmpty(sudoUser))
+    {
+        // Try to get home directory from /etc/passwd
+        var homeFromPasswd = RunCommand("getent", $"passwd {sudoUser}");
+        if (!string.IsNullOrEmpty(homeFromPasswd))
+        {
+            var parts = homeFromPasswd.Split(':');
+            if (parts.Length >= 6)
+            {
+                var homeDir = parts[5];
+                if (Directory.Exists(homeDir))
+                {
+                    Logger.Log($"Found home directory for {sudoUser}: {homeDir}", LogLevel.Trace);
+                    return homeDir;
+                }
+            }
+        }
+        
+        // Fallback: try common home directory locations
+        var commonHomes = new[] { $"/home/{sudoUser}", $"/var/home/{sudoUser}" };
+        foreach (var home in commonHomes)
+        {
+            if (Directory.Exists(home))
+            {
+                Logger.Log($"Found home directory for {sudoUser} at: {home}", LogLevel.Trace);
+                return home;
+            }
+        }
+    }
+    
+    // If running as root, try to find the actual user's home directory
+    if (currentHome == "/root" && OperatingSystem.IsLinux())
+    {
+        // Check for other environment variables that might help
+        var realUser = Environment.GetEnvironmentVariable("USER") ?? 
+                      Environment.GetEnvironmentVariable("LOGNAME") ?? 
+                      Environment.GetEnvironmentVariable("SUDO_USER");
+        
+        if (!string.IsNullOrEmpty(realUser) && realUser != "root")
+        {
+            var homeFromPasswd = RunCommand("getent", $"passwd {realUser}");
+            if (!string.IsNullOrEmpty(homeFromPasswd))
+            {
+                var parts = homeFromPasswd.Split(':');
+                if (parts.Length >= 6)
+                {
+                    var homeDir = parts[5];
+                    if (Directory.Exists(homeDir))
+                    {
+                        Logger.Log($"Found home directory for {realUser}: {homeDir}", LogLevel.Trace);
+                        return homeDir;
+                    }
+                }
+            }
+        }
+        
+        // Try to find the first non-root user's home directory with UID >= 1000
+        var passwdOutput = RunCommand("getent", "passwd");
+        if (!string.IsNullOrEmpty(passwdOutput))
+        {
+            var lines = passwdOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var line in lines)
+            {
+                var parts = line.Split(':');
+                if (parts.Length >= 6 && parts[0] != "root" && !string.IsNullOrEmpty(parts[0]))
+                {
+                    var uid = parts[2];
+                    var homeDir = parts[5];
+                    // Prefer UID >= 1000 (regular users) and existing directories
+                    if (int.TryParse(uid, out var uidInt) && uidInt >= 1000 && Directory.Exists(homeDir))
+                    {
+                        Logger.Log($"Found home directory for user {parts[0]}: {homeDir}", LogLevel.Trace);
+                        return homeDir;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback to current user profile
+    Logger.Log($"Using current home directory: {currentHome}", LogLevel.Trace);
+    return currentHome;
+}
+
+static string RunCommand(string command, string arguments)
+{
+    try
+    {
+        var processInfo = new ProcessStartInfo(command)
+        {
+            Arguments = arguments,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        
+        using var process = Process.Start(processInfo);
+        if (process != null)
+        {
+            process.WaitForExit();
+            if (process.ExitCode == 0)
+            {
+                return process.StandardOutput.ReadToEnd().Trim();
+            }
+        }
+    }
+    catch
+    {
+        // Command not found or failed, return empty
+    }
+    return string.Empty;
+}
+
 // default values
-var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+var homeDir = GetActualUserHomeDirectory();
 var gameDirs = new HashSet<string>() 
 { 
     Path.Combine(homeDir, ".steam/steam/steamapps/common"),
