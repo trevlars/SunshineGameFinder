@@ -15,10 +15,23 @@ static bool CanWriteToPath(string filePath)
     try
     {
         var directory = Path.GetDirectoryName(filePath);
-        if (directory != null && Directory.Exists(directory))
+        if (directory != null)
         {
-            // Check if we can write to the directory
-            var testFile = Path.Combine(directory, ".sunshine_game_finder_write_test");
+            // Create directory if it doesn't exist (if we have permission)
+            if (!Directory.Exists(directory))
+            {
+                try
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+            
+            // Check if we can write to the directory by actually writing and deleting a test file
+            var testFile = Path.Combine(directory, ".sunshine_game_finder_write_test_" + Guid.NewGuid().ToString("N"));
             try
             {
                 File.WriteAllText(testFile, "test");
@@ -27,12 +40,14 @@ static bool CanWriteToPath(string filePath)
             }
             catch
             {
+                // Try to clean up if write succeeded but delete failed
+                try { File.Delete(testFile); } catch { }
                 return false;
             }
         }
         else if (File.Exists(filePath))
         {
-            // Check if we can write to the existing file
+            // Check if we can write to the existing file by trying to open it for writing
             try
             {
                 using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Write);
@@ -406,32 +421,71 @@ async Task ScanFolder(string folder)
                 Logger.Log($"Skipping due to excluded word match", LogLevel.Trace);
                 continue;
             }
-            // On Linux, look for executables without extension or with .sh extension
+            // On Linux, look for actual executables
             var exe = Directory.GetFiles(gameDir.FullName, "*", SearchOption.AllDirectories)
                 .Where(f => 
                 {
                     var fileInfo = new FileInfo(f);
-                    // Check if file is executable (has execute permission) or has common executable extensions
                     var name = fileInfo.Name.ToLower();
-                    var isExecutable = fileInfo.Extension == "" || 
-                                       fileInfo.Extension == ".sh" || 
-                                       fileInfo.Extension == ".AppImage" ||
-                                       name.EndsWith(".x86_64") ||
-                                       name.EndsWith(".x86") ||
-                                       name.EndsWith(".bin");
-                    return isExecutable;
+                    var path = f.ToLower();
+                    
+                    // Exclude common non-executable file types and data directories
+                    var excludedExtensions = new[] { ".bin", ".dll", ".so", ".dylib", ".a", ".lib", ".dat", ".txt", ".json", ".xml", ".lua", ".asset", ".unity", ".meta", ".shader", ".cginc", ".hlsl", ".cg", ".cs", ".bundle", ".framework", ".pak", ".pck", ".exe.pck" };
+                    if (excludedExtensions.Any(ext => name.EndsWith(ext)))
+                    {
+                        return false;
+                    }
+                    
+                    // Exclude files in data/content directories (these are not executables)
+                    var dataDirs = new[] { "/data/", "/_data/", "/content/", "/resources/", "/assets/", "/binaries/win", "/binaries/mac", "/engine/", "/tagame/", "/scripts/", "/level", "/cooked", "/renderer/" };
+                    if (dataDirs.Any(dir => path.Contains(dir)))
+                    {
+                        return false;
+                    }
+                    
+                    // Check for common executable extensions
+                    var executableExtensions = new[] { ".sh", ".appimage", ".run" };
+                    if (executableExtensions.Any(ext => name.EndsWith(ext)))
+                    {
+                        return true;
+                    }
+                    
+                    // Check if filename matches game name (likely the main executable)
+                    var exeNameWithoutExt = Path.GetFileNameWithoutExtension(name);
+                    var gameNameLower = gameName.ToLower();
+                    var dirNameLower = gameDir.Name.ToLower();
+                    if (exeNameWithoutExt == gameNameLower || exeNameWithoutExt == dirNameLower)
+                    {
+                        return true;
+                    }
+                    
+                    // Files without extension in root or Binaries directory might be executables
+                    if (fileInfo.Extension == "" && (path.EndsWith("/" + name) || path.Contains("/binaries/linux") || path.Contains("/binaries/x86_64")))
+                    {
+                        return true;
+                    }
+                    
+                    return false;
+                })
+                .OrderByDescending(f => 
+                {
+                    // Prioritize files that match the game name and are in likely executable locations
+                    var fileName = Path.GetFileNameWithoutExtension(f).ToLower();
+                    var gameNameLower = gameName.ToLower();
+                    var dirNameLower = gameDir.Name.ToLower();
+                    var path = f.ToLower();
+                    
+                    int score = 0;
+                    if (fileName == gameNameLower || fileName == dirNameLower) score += 10;
+                    if (fileName.Contains(gameNameLower) || fileName.Contains(dirNameLower)) score += 5;
+                    if (path.Contains("/binaries/linux") || path.Contains("/binaries/x86_64")) score += 3;
+                    if (!path.Contains("/data/") && !path.Contains("/content/")) score += 2;
+                    return score;
                 })
                 .FirstOrDefault(exefile =>
                 {
                     var exeName = new FileInfo(exefile).Name.ToLower();
-                    var exeNameWithoutExt = Path.GetFileNameWithoutExtension(exeName).ToLower();
-                    var gameNameLower = gameName.ToLower();
-                    var dirNameLower = gameDir.Name.ToLower();
-                    return exeName == dirNameLower || 
-                           exeName == gameNameLower || 
-                           exeNameWithoutExt == dirNameLower ||
-                           exeNameWithoutExt == gameNameLower ||
-                           !exeExclusionWords.Any(ew => exeName.Contains(ew.ToLower()));
+                    return !exeExclusionWords.Any(ew => exeName.Contains(ew.ToLower()));
                 });
             if (string.IsNullOrEmpty(exe))
             {
@@ -468,7 +522,14 @@ async Task ScanFolder(string folder)
                         WorkingDir = ""
                     };
                 }
+                // Try to use covers directory, but fallback to a writable location if needed
                 string coversFolderPath = Path.GetFullPath(Path.Combine(sunshineRootFolder, "covers"));
+                if (!CanWriteToPath(coversFolderPath))
+                {
+                    // Use user's home directory for covers if system directory is read-only
+                    var homeDir = GetActualUserHomeDirectory();
+                    coversFolderPath = Path.Combine(homeDir, ".local/share/sunshine/covers");
+                }
                 string fullPathOfCoverImage = await ImageScraper.SaveIGDBImageToCoversFolder(gameName, coversFolderPath);
                 if (!string.IsNullOrEmpty(fullPathOfCoverImage))
                 {
